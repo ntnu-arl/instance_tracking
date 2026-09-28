@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""Write prerecorded instance-tracking topics into a ROS2 bag."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import importlib
+import logging
+import re
+import shutil
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Dict
+
+import cv2
+import numpy as np
+import rosbag2_py
+import torch
+from rclpy.serialization import deserialize_message, serialize_message
+from sensor_msgs.msg import CompressedImage, Image
+
+from instance_tracking import default_device
+from instance_tracking.tracker import InstanceTracker
+from instance_tracking_ros import Conversions
+from instance_tracking_ros.output_masks import select_output_confidence, select_output_mask
+from instance_tracking_ros.runtime_config import load_runtime_config
+
+LOG = logging.getLogger("instance_tracking_rosbag_writer")
+
+DEFAULT_BAG_SUFFIX = "_instance_tracking"
+DEFAULT_TRACKING_TOPIC = "/tesse/left_cam/rgb/image_raw"
+
+
+@dataclass(frozen=True)
+class TrackingTopics:
+    """Derived output topics for a tracked RGB stream."""
+
+    instances: str
+    masks: str
+    color: str
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run instance tracking offline on a ROS2 bag and write "
+        "prerecorded tracking topics."
+    )
+    parser.add_argument("bag_path", help="Input ROS2 bag directory")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output ROS2 bag directory. Defaults to <bag>_instance_tracking.",
+    )
+    parser.add_argument(
+        "-t",
+        "--topic",
+        dest="topics",
+        action="append",
+        default=[],
+        help=(
+            "RGB topic to track. Repeatable. Defaults to "
+            f"{DEFAULT_TRACKING_TOPIC}."
+        ),
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        dest="config_path",
+        help=(
+            "Optional config path. Defaults to "
+            "instance_tracking_ros/config/openlex_quality.yaml."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Tracker device override. Default: auto.",
+    )
+    parser.add_argument(
+        "--tracking-only",
+        action="store_true",
+        help="Write only tracking topics instead of copying the full input bag.",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Overwrite the output bag if it already exists.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable progress logging for every processed frame.",
+    )
+    return parser.parse_args()
+
+
+def normalize_existing_path(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Bag path '{path}' does not exist")
+    return path.resolve()
+
+
+def default_output_path(bag_path: Path, tracking_only: bool) -> Path:
+    stem = bag_path.name if bag_path.is_dir() else bag_path.stem
+    suffix = f"{DEFAULT_BAG_SUFFIX}_only" if tracking_only else DEFAULT_BAG_SUFFIX
+    return bag_path.parent / f"{stem}{suffix}"
+
+
+def prepare_output_path(path: Path, force: bool) -> None:
+    if path.exists():
+        if not force:
+            raise FileExistsError(
+                f"Output bag '{path}' already exists. Use --force to overwrite it."
+            )
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def detect_storage_id(bag_path: Path) -> str:
+    metadata_path = bag_path / "metadata.yaml"
+    if not metadata_path.exists():
+        return "sqlite3"
+
+    match = re.search(
+        r"^\s*storage_identifier:\s*([^\s]+)\s*$",
+        metadata_path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if match:
+        return match.group(1)
+
+    return "sqlite3"
+
+
+def import_message_type(type_name: str):
+    package, _, message_name = type_name.partition("/msg/")
+    if not package or not message_name:
+        raise ValueError(f"Unsupported ROS message type '{type_name}'")
+
+    module = importlib.import_module(f"{package}.msg")
+    return getattr(module, message_name)
+
+
+def to_tracking_topics(rgb_topic: str) -> TrackingTopics:
+    topic_path = PurePosixPath(rgb_topic)
+    parts = topic_path.parts
+    if len(parts) < 3:
+        raise ValueError(f"RGB topic '{rgb_topic}' is too short to derive tracking topics")
+
+    if parts[-2:] == ("image_raw", "compressed"):
+        camera_ns = topic_path.parent.parent.parent
+    elif parts[-1] == "image_raw":
+        camera_ns = topic_path.parent.parent
+    else:
+        raise ValueError(
+            "RGB topic must end with '/image_raw' or '/image_raw/compressed': "
+            f"'{rgb_topic}'"
+        )
+
+    tracking_ns = camera_ns / "tracking"
+    return TrackingTopics(
+        instances=str(tracking_ns / "instances"),
+        masks=str(tracking_ns / "masks" / "image_raw"),
+        color=str(tracking_ns / "color" / "image_raw"),
+    )
+
+
+def normalize_topic_metadata(entry):
+    return getattr(entry, "topic_metadata", entry)
+
+
+def make_topic_metadata(name: str, type_name: str, template) -> rosbag2_py.TopicMetadata:
+    serialization_format = getattr(template, "serialization_format", "cdr")
+    qos_profiles = getattr(template, "offered_qos_profiles", [])
+    if qos_profiles is None:
+        qos_profiles = []
+    if not isinstance(qos_profiles, list):
+        qos_profiles = []
+
+    type_description_hash = ""
+    if getattr(template, "type", "") == type_name and hasattr(template, "type_description_hash"):
+        type_description_hash = getattr(template, "type_description_hash", "")
+
+    attempts = [
+        (0, name, type_name, serialization_format, qos_profiles, type_description_hash),
+        (0, name, type_name, serialization_format, qos_profiles),
+        (0, name, type_name, serialization_format),
+    ]
+
+    for candidate in attempts:
+        try:
+            return rosbag2_py.TopicMetadata(*candidate)
+        except TypeError:
+            continue
+
+    raise RuntimeError(f"Failed to construct TopicMetadata for topic '{name}'")
+
+
+def decode_rgb_message(msg) -> np.ndarray:
+    if isinstance(msg, Image):
+        return Conversions.to_image(msg, encoding="rgb8")
+
+    if isinstance(msg, CompressedImage):
+        encoded = np.frombuffer(msg.data, dtype=np.uint8)
+        bgr = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("Failed to decode compressed RGB image")
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    raise TypeError(f"Unsupported RGB message type '{type(msg).__name__}'")
+
+
+class OfflineTrackerRunner:
+    """Runs one tracker instance per input RGB topic."""
+
+    def __init__(self, config, verbose: bool):
+        self._config = config
+        self._verbose = verbose
+        self._trackers: Dict[str, InstanceTracker] = {}
+        self._frames_processed: Dict[str, int] = {}
+
+    def get_tracker(self, topic: str, image_shape) -> InstanceTracker:
+        tracker = self._trackers.get(topic)
+        if tracker is not None:
+            return tracker
+
+        tracker_config = copy.deepcopy(self._config.tracker)
+        tracker = InstanceTracker(tracker_config)
+        tracker.warmup(height=image_shape[0], width=image_shape[1])
+        self._trackers[topic] = tracker
+        self._frames_processed[topic] = 0
+        LOG.info(
+            "Initialized tracker for %s on %s",
+            topic,
+            tracker_config.device,
+        )
+        return tracker
+
+    def process(self, topic: str, msg):
+        image = decode_rgb_message(msg)
+        tracker = self.get_tracker(topic, image.shape[:2])
+        with torch.no_grad():
+            result = tracker.process_frame(image)
+
+        self._frames_processed[topic] += 1
+        if self._verbose or result.is_keyframe:
+            LOG.info(
+                "[%s] frame=%d keyframe=%s instances=%d",
+                topic,
+                result.frame_index,
+                result.is_keyframe,
+                result.num_instances,
+            )
+
+        output_mask = select_output_mask(
+            result,
+            self._config.output.publish_keyframe_fastsam_mask,
+        )
+        output_confidence = select_output_confidence(
+            result,
+            self._config.output.publish_keyframe_fastsam_mask,
+        )
+        output_mask_np = output_mask.cpu().numpy().astype(np.uint16)
+        instances_msg = Conversions.to_tracked_instances_msg(
+            msg.header,
+            result,
+            mask_image=output_mask,
+            confidence_image=output_confidence,
+        )
+        mask_msg = Conversions.to_image_msg(
+            msg.header,
+            output_mask_np,
+            encoding="mono16",
+        )
+        color_msg = Conversions.to_image_msg(
+            msg.header,
+            tracker.colorize_mask_image(output_mask),
+            encoding="rgb8",
+        )
+        return instances_msg, mask_msg, color_msg
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    args = parse_args()
+
+    bag_path = normalize_existing_path(args.bag_path)
+    output_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output
+        else default_output_path(bag_path, args.tracking_only).resolve()
+    )
+    if output_path == bag_path:
+        raise ValueError("Output bag path must differ from the input bag path")
+
+    topics = args.topics or [DEFAULT_TRACKING_TOPIC]
+    tracking_topics = {topic: to_tracking_topics(topic) for topic in topics}
+
+    config = load_runtime_config(args.config_path)
+    config.recorder.enabled = False
+    if args.device == "auto":
+        config.tracker.device = default_device(
+            use_cuda=not bool(config.tracker.observation_cache_dir)
+        )
+    else:
+        config.tracker.device = args.device
+
+    storage_id = detect_storage_id(bag_path)
+    converter_options = rosbag2_py.ConverterOptions(
+        input_serialization_format="cdr",
+        output_serialization_format="cdr",
+    )
+
+    reader = rosbag2_py.SequentialReader()
+    reader.open(
+        rosbag2_py.StorageOptions(uri=str(bag_path), storage_id=storage_id),
+        converter_options,
+    )
+    metadata_by_topic = {
+        metadata.name: metadata
+        for metadata in (
+            normalize_topic_metadata(entry) for entry in reader.get_all_topics_and_types()
+        )
+    }
+
+    missing_topics = [topic for topic in topics if topic not in metadata_by_topic]
+    if missing_topics:
+        available_topics = ", ".join(sorted(metadata_by_topic))
+        raise RuntimeError(
+            f"Missing RGB topic(s) in bag: {missing_topics}. Available topics: {available_topics}"
+        )
+
+    if not args.tracking_only:
+        conflicting_topics = [
+            output_topic
+            for topic_set in tracking_topics.values()
+            for output_topic in (topic_set.instances, topic_set.masks, topic_set.color)
+            if output_topic in metadata_by_topic
+        ]
+        if conflicting_topics:
+            raise RuntimeError(
+                "Output tracking topic(s) already exist in the input bag: "
+                f"{sorted(conflicting_topics)}"
+            )
+
+    message_types = {
+        topic: import_message_type(metadata_by_topic[topic].type) for topic in topics
+    }
+
+    prepare_output_path(output_path, args.force)
+
+    writer = rosbag2_py.SequentialWriter()
+    writer.open(
+        rosbag2_py.StorageOptions(uri=str(output_path), storage_id=storage_id),
+        converter_options,
+    )
+
+    created_topics = set()
+
+    def ensure_topic(metadata) -> None:
+        if metadata.name in created_topics:
+            return
+        writer.create_topic(metadata)
+        created_topics.add(metadata.name)
+
+    if args.tracking_only:
+        for input_topic, output_topic_set in tracking_topics.items():
+            template = metadata_by_topic[input_topic]
+            ensure_topic(
+                make_topic_metadata(
+                    output_topic_set.instances,
+                    "instance_tracking_msgs/msg/TrackedInstances",
+                    template,
+                )
+            )
+            ensure_topic(
+                make_topic_metadata(output_topic_set.masks, "sensor_msgs/msg/Image", template)
+            )
+            ensure_topic(
+                make_topic_metadata(output_topic_set.color, "sensor_msgs/msg/Image", template)
+            )
+
+    tracker_runner = OfflineTrackerRunner(config, args.verbose)
+    LOG.info("Reading %s", bag_path)
+    LOG.info("Writing %s", output_path)
+
+    copied_messages = 0
+    tracked_messages = 0
+    while reader.has_next():
+        topic, serialized_data, timestamp = reader.read_next()
+        topic_metadata = metadata_by_topic[topic]
+
+        if not args.tracking_only:
+            ensure_topic(topic_metadata)
+            writer.write(topic, serialized_data, timestamp)
+            copied_messages += 1
+
+        if topic not in tracking_topics:
+            continue
+
+        msg_type = message_types[topic]
+        msg = deserialize_message(serialized_data, msg_type)
+        instances_msg, mask_msg, color_msg = tracker_runner.process(topic, msg)
+        output_topic_set = tracking_topics[topic]
+
+        ensure_topic(
+            make_topic_metadata(
+                output_topic_set.instances,
+                "instance_tracking_msgs/msg/TrackedInstances",
+                topic_metadata,
+            )
+        )
+        ensure_topic(
+            make_topic_metadata(output_topic_set.masks, "sensor_msgs/msg/Image", topic_metadata)
+        )
+        ensure_topic(
+            make_topic_metadata(output_topic_set.color, "sensor_msgs/msg/Image", topic_metadata)
+        )
+
+        writer.write(
+            output_topic_set.instances,
+            serialize_message(instances_msg),
+            timestamp,
+        )
+        writer.write(
+            output_topic_set.masks,
+            serialize_message(mask_msg),
+            timestamp,
+        )
+        writer.write(
+            output_topic_set.color,
+            serialize_message(color_msg),
+            timestamp,
+        )
+        tracked_messages += 1
+
+    LOG.info(
+        "Completed bag export: copied=%d tracked_frames=%d",
+        copied_messages,
+        tracked_messages,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

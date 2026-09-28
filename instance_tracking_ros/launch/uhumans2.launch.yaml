@@ -1,0 +1,17 @@
+---
+launch:
+  - arg: {name: use_sim_time, default: 'true'}
+  - arg:
+      name: config_name
+      default: dev
+      description: Installed tracker preset to use with the uHumans2 topic contract
+
+  - include:
+      file: $(find-pkg-share instance_tracking_ros)/launch/instance_tracking.launch.yaml
+      arg:
+        - {name: config_name, value: $(var config_name)}
+        - {name: namespace, value: tesse/left_cam}
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: rgb_topic, value: rgb/image_raw}
+        - {name: depth_topic, value: /tesse/depth_cam/mono/image_raw}
+        - {name: compressed_rgb, value: 'false'}

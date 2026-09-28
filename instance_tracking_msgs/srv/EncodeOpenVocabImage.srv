@@ -1,0 +1,6 @@
+sensor_msgs/CompressedImage image
+---
+bool success
+string message
+string encoder_id
+float32[] feature

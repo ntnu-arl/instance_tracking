@@ -1,0 +1,187 @@
+# TrackGraph development tracker preset.
+#
+# This preserves the uHumans2 behavior used during development and
+# publishes ViT-B OpenCLIP features expected by the uHumans2 TrackGraph launch.
+
+# Image worker settings
+worker:
+  encoding: rgb8
+  queue_size: 1
+  subscription_queue_size: 1
+  save_cache_queue_size: 32
+  save_cache_subscription_queue_size: 32
+  drop_warn_every: 25
+  min_separation_s: 0.0
+  process_stride: 1
+
+# Normal output is sparse: startup, a 30-second health line, real drop
+# warnings, errors, and a shutdown summary. Enable these only for diagnosis.
+logging:
+  log_config: false
+  log_keyframes: false
+  log_stride_skips: false
+  status_interval_s: 30.0
+
+# Output mask selection
+output:
+  # On keyframes, publish/save the cleaned FastSAM detections remapped to
+  # persistent instance ids instead of the upsampled track-probability mask.
+  publish_keyframe_fastsam_mask: true
+  # Hydra can consume this for propagation confidence gating/weighting. If empty,
+  # Hydra falls back to staleness-only propagation weighting.
+  publish_confidence_image: false
+  # Hydra uses prototypes for tracked-object visual feature association/re-ID.
+  include_track_prototypes: true
+  # Human-inspection topics; not required by Hydra.
+  publish_mask_visualization: true
+  publish_color_visualization: false
+  publish_overlay_visualization: true
+  overlay_alpha: 0.55
+
+# Optional keyframe open-vocabulary CLIP features
+open_vocab:
+  enabled: true
+  device: cuda
+  model_name: ViT-B-16
+  pretrained: openai
+  # OpenCLIP model precision. fp16 is much faster on A100-class GPUs and changes
+  # the published encoder_id suffix; use fp32 for CPU or strict historical replay.
+  precision: fp16
+  crop_padding: 4
+  image_batch_size: 0
+  # Skip masked-crop CLIP inference and publish descriptors from boxed crops only.
+  boxed_only: true
+  rgb_cache_size: 8  # deprecated; retained for config compatibility
+  job_queue_size: 8
+  topic: tracking/open_vocab_features
+  # all_tracks: update every active track present on the current keyframe
+  # source_tracks_only: only publish the initial source-track feature
+  keyframe_update_policy: all_tracks
+  verbosity: 0
+  benchmark:
+    enabled: false
+    # When true, synchronize around timed CLIP encode sections so the recorded
+    # benchmark timings reflect real GPU wall time rather than queued kernels.
+    synchronize_timers: false
+
+# Tracker settings
+tracker:
+  # Run instance segmenter every N frames (keyframe interval)
+  keyframe_interval: 24
+  # Detailed per-frame timing is available for diagnosis but quiet by default.
+  log_processing_timings: false
+  benchmark:
+    enabled: false
+    # When true, synchronize around timed DINOv3/FastSAM sections and persist
+    # per-frame runtime metrics under run_dir/runtime/.
+    synchronize_timers: false
+  
+  # Device for inference (cuda or cpu)
+  device: cuda
+
+  # Optional saved run_* directory containing cache/frame_features and
+  # cache/keyframe_detections. When set, DINOv3/FastSAM inference is bypassed
+  # and the tracker replays cached observations instead.
+  observation_cache_dir: ""
+  
+  # Instance segmenter configuration
+  instance_segmenter:
+    type: fastsam
+    model_name: FastSAM-x.pt
+    confidence: 0.55
+    iou: 0.85
+    output_size: 736
+  
+  # DINOv3 feature extractor configuration
+  feature_extractor:
+    model_name: dinov3_vits16plus
+    short_side: 720
+    # Model architecture is loaded from GitHub (facebookresearch/dinov3)
+    # on first run and cached locally. Weights resolve from
+    # <workspace>/models/dinov3 or DINOV3_WEIGHTS_PATH.
+  
+  # Label propagation configuration
+  propagation:
+    max_context_length: 7
+    neighborhood_size: 12
+    neighborhood_shape: circle  # circle or square
+    topk: 5
+    temperature: 0.2
+
+  # Mask refinement configuration (post-processing for smoother boundaries)
+  mask_refinement:
+    enabled: true
+    stronger_on_keyframes: true
+    keyframe_multiplier: 1.5
+    boundary_mode: balanced  # balanced | conservative | edge_faithful
+
+    smooth_probs: false
+    prob_kernel: 3
+    prob_iters: 1
+
+    upsample_mode: bilinear
+    upsample_align_corners: false
+    post_smooth: true
+    post_kernel: 3
+    post_iters: 1
+
+    morph_open: true
+    morph_close: true
+    morph_kernel: 3
+    morph_iters: 1
+    kernel_tolerance: 1.0e-3
+
+    threshold: 0.5
+    resolve_overlaps: true
+    overlap_strategy: confidence
+
+    # Keyframe-only refinement of FastSAM masks (before downsampling)
+    keyframe_refine_enabled: true
+    keyframe_refine_morph_open: true
+    keyframe_refine_morph_close: true
+    keyframe_refine_kernel: 3
+    keyframe_refine_iters: 1
+    keyframe_refine_dilate: false
+    keyframe_refine_dilation_iters: 1
+  
+  # Track manager configuration
+  # Uses combined IoU + feature similarity for track-to-detection matching
+  track_manager:
+    # Matching weights (should sum to 1.0)
+    iou_weight: 0.5           # Weight for spatial IoU similarity
+    feature_weight: 0.5       # Weight for DINOv3 feature cosine similarity
+
+    # Minimum IoU required before a track/detection pair is considered for
+    # keyframe assignment.
+    min_iou_gate: 0.15
+
+    # Minimum current_propagated_mask_area / last_keyframe_mask_area required
+    # for an existing propagated track to remain eligible for keyframe
+    # association.
+    eligibility_factor: 0.10
+
+    # Update the published per-track prototype only on matched keyframes using
+    #   normalize((1 - alpha) * old + alpha * keyframe_proto)
+    # The display color stays fixed from track creation.
+    prototype_ema_alpha: 0.20
+    
+    # Minimum combined score to accept a match
+    alignment_threshold: 0.35
+    
+    # Frames before terminating unmatched tracks
+    max_lost_frames: 10
+
+# Data recorder settings
+recorder:
+  enabled: false              # Can be overridden by env INSTANCE_TRACKING_SAVE=1
+  save_depth: true            # Save raw aligned depth maps (.npy) for each frame
+  save_depth_viz: true        # Save colorized depth visualizations for each frame
+  save_features: false        # Save DINOv3 features for keyframes (env: INSTANCE_TRACKING_SAVE_FEATURES=1)
+  save_probabilities: false   # Save patch/final argmax probability maps (env: INSTANCE_TRACKING_SAVE_PROBABILITIES=1)
+  save_observation_cache: false  # Save all-frame DINO features + raw refined keyframe detections
+  save_prototypes: true       # Save keyframe prototype snapshots for analysis
+  output_root: data/instance_tracking
+  queue_size: 16
+  video_fps: 20.0
+  image_format: png
+  viz_format: jpg

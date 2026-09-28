@@ -1,0 +1,141 @@
+# OpenLex-quality TrackGraph tracker preset.
+#
+# This is the validated OpenLex-quality configuration: DINOv3
+# ViT-S+ at 720 px, and OpenCLIP ViT-H with feature-quality observation gates.
+
+worker:
+  encoding: rgb8
+  queue_size: 32
+  subscription_queue_size: 32
+  save_cache_queue_size: 32
+  save_cache_subscription_queue_size: 32
+  drop_warn_every: 25
+  min_separation_s: 0.0
+  process_stride: 1
+
+logging:
+  log_config: false
+  log_keyframes: false
+  log_stride_skips: false
+  status_interval_s: 30.0
+
+output:
+  publish_keyframe_fastsam_mask: true
+  publish_confidence_image: false
+  include_track_prototypes: true
+  publish_mask_visualization: false
+  publish_color_visualization: false
+  publish_overlay_visualization: true
+  overlay_alpha: 0.55
+
+open_vocab:
+  enabled: true
+  device: cuda
+  model_name: ViT-H-14
+  pretrained: laion2b_s32b_b79k
+  precision: fp16
+  crop_padding: 40
+  crop_sampling_mode: warp_bbox
+  image_batch_size: 8
+  normalize_embeddings_before_fusion: true
+  use_full_image_feature: false
+  boxed_only: true
+  boxed_feature_weight: 1.0
+  masked_feature_weight: 1.0
+  rgb_cache_size: 8
+  job_queue_size: 32
+  topic: tracking/open_vocab_features
+  keyframe_update_policy: all_tracks
+  verbosity: 0
+  benchmark:
+    enabled: false
+    synchronize_timers: false
+  temporal_consistency:
+    enabled: true
+    warmup_observations: 3
+    reject_below_cosine: 0.55
+    downweight_below_cosine: 0.75
+    min_downweight: 0.25
+  observation_quality:
+    min_bbox_short_side_px: 24.0
+    min_mask_to_box_fill: 0.07
+    padding_clamp_full_fraction: 1.0
+    padding_clamp_min_weight: 0.5
+    image_boundary_weight: 0.5
+    min_update_weight: 1.0e-6
+
+tracker:
+  keyframe_interval: 24
+  log_processing_timings: false
+  benchmark:
+    enabled: false
+    synchronize_timers: false
+  device: cuda
+  observation_cache_dir: ""
+
+  instance_segmenter:
+    type: fastsam
+    model_name: FastSAM-x.pt
+    confidence: 0.55
+    iou: 0.85
+    output_size: 736
+
+  feature_extractor:
+    model_name: dinov3_vits16plus
+    short_side: 720
+
+  propagation:
+    max_context_length: 7
+    neighborhood_size: 12
+    neighborhood_shape: circle
+    topk: 5
+    temperature: 0.2
+
+  mask_refinement:
+    enabled: true
+    stronger_on_keyframes: false
+    boundary_mode: balanced
+    smooth_probs: false
+    prob_kernel: 3
+    prob_iters: 1
+    upsample_mode: bilinear
+    upsample_align_corners: false
+    post_smooth: false
+    morph_open: false
+    morph_close: false
+    morph_kernel: 3
+    morph_iters: 1
+    kernel_tolerance: 1.0e-3
+    threshold: 0.5
+    resolve_overlaps: true
+    overlap_strategy: confidence
+    keyframe_refine_enabled: true
+    keyframe_refine_morph_open: false
+    keyframe_refine_morph_close: false
+    keyframe_refine_kernel: 3
+    keyframe_refine_iters: 1
+    keyframe_refine_dilate: false
+    keyframe_refine_dilation_iters: 1
+
+  track_manager:
+    iou_weight: 0.5
+    feature_weight: 0.5
+    min_iou_gate: 0.15
+    eligibility_factor: 0.10
+    prototype_ema_alpha: 0.20
+    alignment_threshold: 0.35
+    max_lost_frames: 10
+
+recorder:
+  enabled: false
+  save_depth: true
+  save_depth_viz: true
+  save_features: false
+  save_probabilities: false
+  save_observation_cache: false
+  save_prototypes: true
+  output_root: data/instance_tracking
+  queue_size: 16
+  video_fps: 20.0
+  image_format: png
+  viz_format: jpg

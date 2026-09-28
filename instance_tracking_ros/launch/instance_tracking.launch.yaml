@@ -1,0 +1,71 @@
+---
+launch:
+  - arg:
+      name: config_name
+      default: dev
+      description: Installed tracker preset name without the .yaml suffix
+
+  - arg:
+      name: config_path
+      default: $(find-pkg-share instance_tracking_ros)/config/$(var config_name).yaml
+      description: Configuration file for instance tracker; overrides config_name
+
+  - arg:
+      name: namespace
+      default: ''
+      description: Optional ROS namespace for the tracker node
+
+  - arg:
+      name: use_sim_time
+      default: 'false'
+      description: Use ROS sim time
+
+  - arg:
+      name: rgb_topic
+      default: color/image_raw
+      description: Input RGB topic to remap onto color/image_raw
+
+  - arg:
+      name: rgb_compressed_topic
+      default: $(var rgb_topic)/compressed
+      description: Input compressed RGB topic to remap onto color/image_raw/compressed
+
+  - arg:
+      name: depth_topic
+      default: depth_registered/image_rect
+      description: Input depth topic to remap onto depth_registered/image_rect
+  
+  - arg:
+      name: compressed_rgb
+      default: 'false'
+      description: Triggers decompression for RGB stream
+  
+  # Optional image decompression
+  - node:
+      if: $(var compressed_rgb)
+      pkg: image_transport
+      exec: republish
+      namespace: $(var namespace)
+      name: decompress_rgb
+      param:
+        - {name: in_transport, value: compressed}
+        - {name: out_transport, value: raw}
+        - {name: use_sim_time, value: $(var use_sim_time)}
+      remap:
+        - {from: in/compressed, to: $(var rgb_compressed_topic)}
+        - {from: out, to: color/image_raw}
+  
+  # Instance tracking node
+  - node:
+      pkg: instance_tracking_ros
+      exec: instance_tracking_node
+      namespace: $(var namespace)
+      name: instance_tracking
+      output: screen
+      on_exit: shutdown
+      param:
+        - {name: config_path, value: $(var config_path), type: str}
+        - {name: use_sim_time, value: $(var use_sim_time)}
+      remap:
+        - {from: color/image_raw, to: $(var rgb_topic)}
+        - {from: depth_registered/image_rect, to: $(var depth_topic)}

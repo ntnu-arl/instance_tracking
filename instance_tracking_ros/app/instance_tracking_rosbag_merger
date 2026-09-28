@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Merge a full sensor bag with an existing tracking bag without rerunning tracking."""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import shutil
+from pathlib import Path
+from typing import Optional, Tuple
+
+import rosbag2_py
+
+LOG = logging.getLogger("instance_tracking_rosbag_merger")
+DEFAULT_BAG_SUFFIX = "_instance_tracking_merged"
+
+
+BagMessage = Tuple[str, bytes, int]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Merge a full sensor ROS2 bag with an existing tracking-only or merged "
+            "bag, without rerunning instance tracking."
+        )
+    )
+    parser.add_argument("sensor_bag", help="Input sensor ROS2 bag directory")
+    parser.add_argument("tracking_bag", help="Input tracking-only or merged ROS2 bag directory")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help=(
+            "Output ROS2 bag directory. Defaults to <sensor_bag>"
+            f"{DEFAULT_BAG_SUFFIX}."
+        ),
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="Overwrite the output bag if it already exists.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Log every written message source for debugging.",
+    )
+    return parser.parse_args()
+
+
+def normalize_existing_path(path_str: str) -> Path:
+    path = Path(path_str).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"Bag path '{path}' does not exist")
+    return path.resolve()
+
+
+def default_output_path(sensor_bag: Path) -> Path:
+    stem = sensor_bag.name if sensor_bag.is_dir() else sensor_bag.stem
+    return sensor_bag.parent / f"{stem}{DEFAULT_BAG_SUFFIX}"
+
+
+def prepare_output_path(path: Path, force: bool) -> None:
+    if path.exists():
+        if not force:
+            raise FileExistsError(
+                f"Output bag '{path}' already exists. Use --force to overwrite it."
+            )
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def detect_storage_id(bag_path: Path) -> str:
+    metadata_path = bag_path / "metadata.yaml"
+    if not metadata_path.exists():
+        return "sqlite3"
+
+    match = re.search(
+        r"^\s*storage_identifier:\s*([^\s]+)\s*$",
+        metadata_path.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    if match:
+        return match.group(1)
+
+    return "sqlite3"
+
+
+def normalize_topic_metadata(entry):
+    return getattr(entry, "topic_metadata", entry)
+
+
+def next_message(
+    reader: rosbag2_py.SequentialReader,
+    allowed_topics: Optional[set[str]] = None,
+) -> Optional[BagMessage]:
+    while reader.has_next():
+        topic, serialized_data, timestamp = reader.read_next()
+        if allowed_topics is None or topic in allowed_topics:
+            return topic, serialized_data, timestamp
+    return None
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+    args = parse_args()
+
+    sensor_bag = normalize_existing_path(args.sensor_bag)
+    tracking_bag = normalize_existing_path(args.tracking_bag)
+    output_path = (
+        Path(args.output).expanduser().resolve()
+        if args.output
+        else default_output_path(sensor_bag).resolve()
+    )
+
+    if output_path == sensor_bag or output_path == tracking_bag:
+        raise ValueError("Output bag path must differ from both input bags")
+
+    sensor_storage_id = detect_storage_id(sensor_bag)
+    tracking_storage_id = detect_storage_id(tracking_bag)
+    if sensor_storage_id != tracking_storage_id:
+        LOG.warning(
+            "Input bags use different storage backends (%s vs %s); writing output as %s",
+            sensor_storage_id,
+            tracking_storage_id,
+            sensor_storage_id,
+        )
+
+    converter_options = rosbag2_py.ConverterOptions(
+        input_serialization_format="cdr",
+        output_serialization_format="cdr",
+    )
+
+    sensor_reader = rosbag2_py.SequentialReader()
+    sensor_reader.open(
+        rosbag2_py.StorageOptions(uri=str(sensor_bag), storage_id=sensor_storage_id),
+        converter_options,
+    )
+    tracking_reader = rosbag2_py.SequentialReader()
+    tracking_reader.open(
+        rosbag2_py.StorageOptions(uri=str(tracking_bag), storage_id=tracking_storage_id),
+        converter_options,
+    )
+
+    sensor_metadata = {
+        metadata.name: metadata
+        for metadata in (
+            normalize_topic_metadata(entry)
+            for entry in sensor_reader.get_all_topics_and_types()
+        )
+    }
+    tracking_metadata = {
+        metadata.name: metadata
+        for metadata in (
+            normalize_topic_metadata(entry)
+            for entry in tracking_reader.get_all_topics_and_types()
+        )
+    }
+
+    conflicting_types = [
+        topic
+        for topic, tracking_topic_metadata in tracking_metadata.items()
+        if topic in sensor_metadata and sensor_metadata[topic].type != tracking_topic_metadata.type
+    ]
+    if conflicting_types:
+        raise RuntimeError(
+            "Tracking bag contains topic(s) that conflict with sensor bag types: "
+            f"{sorted(conflicting_types)}"
+        )
+
+    tracking_topics_to_copy = {
+        topic for topic in tracking_metadata if topic not in sensor_metadata
+    }
+    if not tracking_topics_to_copy:
+        LOG.warning(
+            "Tracking bag '%s' does not contribute any topics beyond the sensor bag",
+            tracking_bag,
+        )
+    else:
+        LOG.info(
+            "Tracking bag contributes %d topic(s): %s",
+            len(tracking_topics_to_copy),
+            sorted(tracking_topics_to_copy),
+        )
+
+    prepare_output_path(output_path, args.force)
+
+    writer = rosbag2_py.SequentialWriter()
+    writer.open(
+        rosbag2_py.StorageOptions(uri=str(output_path), storage_id=sensor_storage_id),
+        converter_options,
+    )
+
+    created_topics = set()
+
+    def ensure_topic(metadata) -> None:
+        if metadata.name in created_topics:
+            return
+        writer.create_topic(metadata)
+        created_topics.add(metadata.name)
+
+    for metadata in sensor_metadata.values():
+        ensure_topic(metadata)
+    for topic in sorted(tracking_topics_to_copy):
+        ensure_topic(tracking_metadata[topic])
+
+    sensor_next = next_message(sensor_reader)
+    tracking_next = next_message(tracking_reader, tracking_topics_to_copy)
+
+    sensor_count = 0
+    tracking_count = 0
+    while sensor_next is not None or tracking_next is not None:
+        take_sensor = tracking_next is None or (
+            sensor_next is not None and sensor_next[2] <= tracking_next[2]
+        )
+        if take_sensor:
+            topic, serialized_data, timestamp = sensor_next
+            writer.write(topic, serialized_data, timestamp)
+            sensor_count += 1
+            if args.verbose:
+                LOG.info("sensor topic=%s timestamp=%d", topic, timestamp)
+            sensor_next = next_message(sensor_reader)
+        else:
+            topic, serialized_data, timestamp = tracking_next
+            writer.write(topic, serialized_data, timestamp)
+            tracking_count += 1
+            if args.verbose:
+                LOG.info("tracking topic=%s timestamp=%d", topic, timestamp)
+            tracking_next = next_message(tracking_reader, tracking_topics_to_copy)
+
+    LOG.info(
+        "Completed bag merge: copied_sensor=%d copied_tracking=%d output=%s",
+        sensor_count,
+        tracking_count,
+        output_path,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

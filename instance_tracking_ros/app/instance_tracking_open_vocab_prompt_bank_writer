@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Write an offline prompt bank by querying the tracker text-embedding service."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import threading
+import time
+
+import rclpy
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+
+from instance_tracking_msgs.srv import EncodeOpenVocabText
+from instance_tracking_ros.open_vocab import OpenVocabFeatureWorker
+from instance_tracking_ros.prompt_bank import load_prompt_file, save_prompt_bank
+from instance_tracking_ros.runtime_config import load_runtime_config
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments."""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Start the instance-tracking open-vocabulary text encoder, query the same "
+            "tracking/open_vocab/encode_text service Hydra uses, and save the prompt "
+            "embeddings for offline reuse."
+        )
+    )
+    parser.add_argument(
+        "output_path",
+        help="Destination JSON file for the saved prompt bank.",
+    )
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        default="",
+        help="Optional instance_tracking_ros runtime config path.",
+    )
+    parser.add_argument(
+        "--device",
+        default="",
+        help="Optional override for open_vocab.device, e.g. 'cuda' or 'cpu'.",
+    )
+    parser.add_argument(
+        "--prompt",
+        action="append",
+        default=[],
+        help="Prompt text to encode. Repeat for multiple prompts.",
+    )
+    parser.add_argument(
+        "--prompt-file",
+        default="",
+        help="Optional text file with one prompt per line. Blank lines and # comments are ignored.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the output file if it already exists.",
+    )
+    parser.add_argument(
+        "--service-wait-timeout",
+        type=float,
+        default=60.0,
+        help="Seconds to wait for the local text-embedding service to become ready.",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait per prompt request.",
+    )
+    return parser.parse_args()
+
+
+def collect_prompts(args: argparse.Namespace) -> list[str]:
+    """Merge prompts from CLI and optional prompt file."""
+
+    prompts = list(args.prompt)
+    if args.prompt_file:
+        prompts.extend(load_prompt_file(args.prompt_file))
+
+    prompts = [prompt.strip() for prompt in prompts if prompt.strip()]
+    if not prompts:
+        raise ValueError("at least one --prompt or --prompt-file entry is required")
+
+    return prompts
+
+
+class OpenVocabPromptBankServer(Node):
+    """Minimal node that exposes the tracker-owned text-embedding service."""
+
+    def __init__(self, config_path: str | None, device_override: str | None):
+        super().__init__("instance_tracking_open_vocab_prompt_bank_server")
+
+        config = load_runtime_config(config_path or None)
+        config.open_vocab.enabled = True
+        if device_override:
+            config.open_vocab.device = device_override
+
+        self._worker = OpenVocabFeatureWorker(self, config.open_vocab)
+
+    def stop(self) -> None:
+        """Stop background worker state before node destruction."""
+
+        self._worker.stop()
+
+
+def wait_for_future(future, timeout_s: float):
+    """Wait for an rclpy future while an executor spins in the background."""
+
+    deadline = time.monotonic() + timeout_s
+    while not future.done() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    if not future.done():
+        raise TimeoutError(f"request did not complete within {timeout_s:.1f}s")
+
+    return future.result()
+
+
+def main() -> int:
+    """Run the prompt-bank writer."""
+
+    args = parse_args()
+    try:
+        prompts = collect_prompts(args)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    rclpy.init(args=None)
+    executor = MultiThreadedExecutor(num_threads=2)
+    spin_thread = None
+    server = None
+    client_node = None
+
+    try:
+        server = OpenVocabPromptBankServer(args.config_path, args.device)
+        client_node = Node("instance_tracking_open_vocab_prompt_bank_writer")
+        executor.add_node(server)
+        executor.add_node(client_node)
+
+        spin_thread = threading.Thread(target=executor.spin, daemon=True)
+        spin_thread.start()
+
+        client = client_node.create_client(
+            EncodeOpenVocabText,
+            "tracking/open_vocab/encode_text",
+        )
+        if not client.wait_for_service(timeout_sec=args.service_wait_timeout):
+            raise RuntimeError(
+                "timed out waiting for tracking/open_vocab/encode_text to become ready"
+            )
+
+        encoder_id = ""
+        features = []
+        for prompt in prompts:
+            request = EncodeOpenVocabText.Request()
+            request.prompt = prompt
+            response = wait_for_future(client.call_async(request), args.request_timeout)
+            if response is None:
+                raise RuntimeError(f"service returned no response for prompt '{prompt}'")
+            if not response.encoder_id or not response.feature:
+                raise RuntimeError(f"empty embedding returned for prompt '{prompt}'")
+
+            if not encoder_id:
+                encoder_id = response.encoder_id
+            elif encoder_id != response.encoder_id:
+                raise RuntimeError(
+                    "service returned inconsistent encoder ids: "
+                    f"'{encoder_id}' vs '{response.encoder_id}'"
+                )
+
+            features.append(response.feature)
+
+        output_path = save_prompt_bank(
+            args.output_path,
+            encoder_id=encoder_id,
+            prompts=prompts,
+            features=features,
+            overwrite=args.force,
+        )
+        print(f"Saved {len(prompts)} prompt embeddings to {output_path}")
+        print(f"encoder_id={encoder_id}")
+        return 0
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if server is not None:
+            server.stop()
+        if client_node is not None:
+            executor.remove_node(client_node)
+            client_node.destroy_node()
+        if server is not None:
+            executor.remove_node(server)
+            server.destroy_node()
+        executor.shutdown()
+        if spin_thread is not None:
+            spin_thread.join(timeout=2.0)
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

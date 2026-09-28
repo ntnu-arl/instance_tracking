@@ -1,0 +1,13 @@
+torch
+torchvision
+torchmetrics
+termcolor
+ultralytics
+numpy<2
+spark_config @ git+https://github.com/MIT-SPARK/Spark-Config.git
+
+[dev]
+pytest
+
+[open_vocab]
+open_clip_torch

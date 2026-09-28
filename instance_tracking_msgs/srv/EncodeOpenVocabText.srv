@@ -1,0 +1,4 @@
+string prompt
+---
+string encoder_id
+float32[] feature

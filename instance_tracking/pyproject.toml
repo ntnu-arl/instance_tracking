@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+license = {text = "BSD-3-Clause"}
+name = "instance_tracking"
+version = "0.0.1"
+authors = [
+    { name = "Peder Borge Hellesylt", email = "pederbh@stud.ntnu.no" },
+]
+description = "Instance tracking with sparse segmentation and dense propagation"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch",
+    "torchvision",
+    "torchmetrics",
+    "termcolor",
+    "ultralytics",
+    "numpy<2",
+    "spark_config@git+https://github.com/MIT-SPARK/Spark-Config.git",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+open_vocab = ["open_clip_torch"]

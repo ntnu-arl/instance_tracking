@@ -1,0 +1,939 @@
+#!/usr/bin/env python3
+"""ROS2 node for instance tracking with sparse segmentation and dense propagation."""
+
+import os
+import signal
+import threading
+import time
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+
+import rclpy
+import torch
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+
+from instance_tracking import default_device
+from instance_tracking.tracker import InstanceTracker
+from instance_tracking_ros import Conversions, ImageWorker
+from instance_tracking_ros.cadence import is_camera_keyframe
+from instance_tracking_ros.data_recorder import DataRecorder
+from instance_tracking_ros.open_vocab import OpenVocabFeatureWorker
+from instance_tracking_ros.output_masks import (
+    render_mask_overlay,
+    select_output_confidence,
+    select_output_mask,
+)
+from instance_tracking_ros.runtime_config import (
+    InstanceTrackingNodeConfig,
+    load_runtime_config,
+)
+from instance_tracking_ros.runtime_metrics import RuntimeMetricsRecorder
+from instance_tracking_msgs.msg import TrackedInstances
+
+
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def parse_env_bool(name: str) -> bool | None:
+    """Parse a truthy/falsy environment variable if present."""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+
+    return value.lower() in TRUE_ENV_VALUES
+
+
+def parse_env_int(name: str) -> int | None:
+    """Parse an integer environment variable if present."""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return int(value)
+
+
+class InstanceTrackingNode(Node):
+    """ROS2 node for instance tracking.
+    
+    Subscribes to RGB images and publishes tracked instance masks.
+    """
+    
+    def __init__(self):
+        """Initialize the node."""
+        super().__init__("instance_tracking_node")
+        
+        # Load configuration
+        config_path = (
+            self.declare_parameter("config_path", "")
+            .get_parameter_value()
+            .string_value
+        )
+        try:
+            self.config = load_runtime_config(config_path or None)
+        except FileNotFoundError as exc:
+            self.get_logger().warn(f"{exc}, using defaults")
+            self.config = InstanceTrackingNodeConfig()
+
+        # Allow env toggle for saving without modifying config file
+        save_env = parse_env_bool("INSTANCE_TRACKING_SAVE")
+        if save_env is not None:
+            self.config.recorder.enabled = save_env
+
+        # Optional output root override for recorder
+        output_root_env = os.getenv("INSTANCE_TRACKING_OUTPUT_ROOT")
+        if output_root_env:
+            self.config.recorder.output_root = output_root_env
+        
+        # Allow env toggle for feature saving
+        save_features_env = parse_env_bool("INSTANCE_TRACKING_SAVE_FEATURES")
+        if save_features_env is not None:
+            self.config.recorder.save_features = save_features_env
+            # Feature saving implies data saving
+            if self.config.recorder.save_features:
+                self.config.recorder.enabled = True
+
+        save_probabilities_env = parse_env_bool("INSTANCE_TRACKING_SAVE_PROBABILITIES")
+        if save_probabilities_env is not None:
+            self.config.recorder.save_probabilities = save_probabilities_env
+            if self.config.recorder.save_probabilities:
+                self.config.recorder.enabled = True
+
+        save_depth_env = parse_env_bool("INSTANCE_TRACKING_SAVE_DEPTH")
+        if save_depth_env is not None:
+            self.config.recorder.save_depth = save_depth_env
+            if self.config.recorder.save_depth:
+                self.config.recorder.enabled = True
+
+        save_depth_viz_env = parse_env_bool("INSTANCE_TRACKING_SAVE_DEPTH_VIZ")
+        if save_depth_viz_env is not None:
+            self.config.recorder.save_depth_viz = save_depth_viz_env
+            if self.config.recorder.save_depth_viz:
+                self.config.recorder.enabled = True
+
+        save_raw_probabilities_env = parse_env_bool(
+            "INSTANCE_TRACKING_SAVE_RAW_PROBABILITIES"
+        )
+        if save_raw_probabilities_env is not None:
+            self.config.recorder.save_raw_probabilities = save_raw_probabilities_env
+            if self.config.recorder.save_raw_probabilities:
+                self.config.recorder.enabled = True
+
+        save_cache_env = parse_env_bool("INSTANCE_TRACKING_SAVE_OBSERVATION_CACHE")
+        if save_cache_env is not None:
+            self.config.recorder.save_observation_cache = save_cache_env
+            if self.config.recorder.save_observation_cache:
+                self.config.recorder.enabled = True
+
+        save_prototypes_env = parse_env_bool("INSTANCE_TRACKING_SAVE_PROTOTYPES")
+        if save_prototypes_env is not None:
+            self.config.recorder.save_prototypes = save_prototypes_env
+            if self.config.recorder.save_prototypes:
+                self.config.recorder.enabled = True
+
+        tracker_benchmark_env = parse_env_bool("INSTANCE_TRACKING_BENCHMARK")
+        if tracker_benchmark_env is not None:
+            self.config.tracker.benchmark.enabled = tracker_benchmark_env
+
+        tracker_benchmark_sync_env = parse_env_bool(
+            "INSTANCE_TRACKING_BENCHMARK_SYNCHRONIZE_TIMERS"
+        )
+        if tracker_benchmark_sync_env is not None:
+            self.config.tracker.benchmark.synchronize_timers = (
+                tracker_benchmark_sync_env
+            )
+
+        open_vocab_benchmark_env = parse_env_bool(
+            "INSTANCE_TRACKING_OPEN_VOCAB_BENCHMARK"
+        )
+        if open_vocab_benchmark_env is not None:
+            self.config.open_vocab.benchmark.enabled = open_vocab_benchmark_env
+
+        open_vocab_enabled_env = parse_env_bool("INSTANCE_TRACKING_OPEN_VOCAB_ENABLED")
+        if open_vocab_enabled_env is not None:
+            self.config.open_vocab.enabled = open_vocab_enabled_env
+
+        open_vocab_benchmark_sync_env = parse_env_bool(
+            "INSTANCE_TRACKING_OPEN_VOCAB_BENCHMARK_SYNCHRONIZE_TIMERS"
+        )
+        if open_vocab_benchmark_sync_env is not None:
+            self.config.open_vocab.benchmark.synchronize_timers = (
+                open_vocab_benchmark_sync_env
+            )
+
+        process_stride_env = parse_env_int("INSTANCE_TRACKING_PROCESS_STRIDE")
+        if process_stride_env is not None:
+            self.config.worker.process_stride = process_stride_env
+
+        worker_queue_size_env = parse_env_int("INSTANCE_TRACKING_WORKER_QUEUE_SIZE")
+        if worker_queue_size_env is not None:
+            self.config.worker.queue_size = worker_queue_size_env
+
+        worker_subscription_queue_size_env = parse_env_int(
+            "INSTANCE_TRACKING_WORKER_SUBSCRIPTION_QUEUE_SIZE"
+        )
+        if worker_subscription_queue_size_env is not None:
+            self.config.worker.subscription_queue_size = worker_subscription_queue_size_env
+
+        dino_model_env = os.getenv("INSTANCE_TRACKING_DINO_MODEL")
+        if dino_model_env:
+            self.config.tracker.feature_extractor.model_name = dino_model_env
+
+        dino_short_side_env = parse_env_int("INSTANCE_TRACKING_DINO_SHORT_SIDE")
+        if dino_short_side_env is not None:
+            self.config.tracker.feature_extractor.short_side = dino_short_side_env
+
+        open_vocab_model_env = os.getenv("INSTANCE_TRACKING_OPEN_VOCAB_MODEL_NAME")
+        if open_vocab_model_env:
+            self.config.open_vocab.model_name = open_vocab_model_env
+
+        open_vocab_pretrained_env = os.getenv("INSTANCE_TRACKING_OPEN_VOCAB_PRETRAINED")
+        if open_vocab_pretrained_env:
+            self.config.open_vocab.pretrained = open_vocab_pretrained_env
+
+        open_vocab_precision_env = os.getenv("INSTANCE_TRACKING_OPEN_VOCAB_PRECISION")
+        if open_vocab_precision_env:
+            self.config.open_vocab.precision = open_vocab_precision_env
+
+        open_vocab_image_batch_env = parse_env_int("INSTANCE_TRACKING_OPEN_VOCAB_IMAGE_BATCH_SIZE")
+        if open_vocab_image_batch_env is not None:
+            self.config.open_vocab.image_batch_size = open_vocab_image_batch_env
+
+        publish_confidence_env = parse_env_bool(
+            "INSTANCE_TRACKING_PUBLISH_CONFIDENCE_IMAGE"
+        )
+        if publish_confidence_env is not None:
+            self.config.output.publish_confidence_image = publish_confidence_env
+
+        include_prototypes_env = parse_env_bool(
+            "INSTANCE_TRACKING_INCLUDE_TRACK_PROTOTYPES"
+        )
+        if include_prototypes_env is not None:
+            self.config.output.include_track_prototypes = include_prototypes_env
+
+        publish_mask_viz_env = parse_env_bool(
+            "INSTANCE_TRACKING_PUBLISH_MASK_VISUALIZATION"
+        )
+        if publish_mask_viz_env is not None:
+            self.config.output.publish_mask_visualization = publish_mask_viz_env
+
+        publish_color_viz_env = parse_env_bool(
+            "INSTANCE_TRACKING_PUBLISH_COLOR_VISUALIZATION"
+        )
+        if publish_color_viz_env is not None:
+            self.config.output.publish_color_visualization = publish_color_viz_env
+
+        publish_overlay_viz_env = parse_env_bool(
+            "INSTANCE_TRACKING_PUBLISH_OVERLAY_VISUALIZATION"
+        )
+        if publish_overlay_viz_env is not None:
+            self.config.output.publish_overlay_visualization = publish_overlay_viz_env
+
+        replay_cache_env = os.getenv("INSTANCE_TRACKING_REPLAY_CACHE")
+        if replay_cache_env:
+            self.config.tracker.observation_cache_dir = replay_cache_env
+            self.config.tracker.device = "cpu"
+        else:
+            self.config.tracker.device = default_device(
+                use_cuda=not bool(self.config.tracker.observation_cache_dir)
+            )
+        if self.config.open_vocab.enabled:
+            self.config.open_vocab.device = default_device(
+                use_cuda=self.config.open_vocab.device != "cpu"
+            )
+
+        config_label = Path(config_path).name if config_path else "openlex_quality.yaml"
+        open_vocab_label = "disabled"
+        if self.config.open_vocab.enabled:
+            open_vocab_label = (
+                f"openclip:{self.config.open_vocab.model_name}:"
+                f"{self.config.open_vocab.pretrained}:"
+                f"precision={self.config.open_vocab.precision}"
+            )
+        self.get_logger().info(
+            "Initializing instance tracker: "
+            f"config={config_label}, "
+            f"device={self.config.tracker.device}, "
+            f"dino={self.config.tracker.feature_extractor.model_name}"
+            f"@{self.config.tracker.feature_extractor.short_side}px, "
+            f"segmenter={self.config.tracker.instance_segmenter.model_name}, "
+            f"keyframe_interval={self.config.tracker.keyframe_interval}, "
+            f"process_stride={self.config.worker.process_stride}, "
+            f"queue={self.config.worker.queue_size}, "
+            f"open_vocab={open_vocab_label}"
+        )
+        if self.config.logging.log_config:
+            self.get_logger().info(f"Full configuration:\n{self.config.show()}")
+        else:
+            self.get_logger().debug(f"Full configuration:\n{self.config.show()}")
+        
+        # Initialize tracker
+        self._tracker = InstanceTracker(self.config.tracker)
+        self._tracker.warmup()  # Eagerly load models to avoid slow first frame
+        self.get_logger().info(f"Tracker initialized on device: {self.config.tracker.device}")
+        self._runtime_metrics = None
+        if self.config.tracker.benchmark.enabled:
+            self._runtime_metrics = RuntimeMetricsRecorder(
+                self.get_logger(),
+                metadata={
+                    "tracker_device": self.config.tracker.device,
+                    "uses_cached_observations": self._tracker.uses_cached_observations,
+                    "benchmark_synchronize_timers": bool(
+                        self.config.tracker.benchmark.synchronize_timers
+                    ),
+                },
+                numeric_fields=(
+                    "frame_index",
+                    "camera_frame_index",
+                    "num_tracks",
+                    "dino_ms",
+                    "fastsam_ms",
+                    "keyframe_mask_refine_ms",
+                    "keyframe_track_update_ms",
+                    "keyframe_label_image_ms",
+                    "propagation_ms",
+                    "propagation_update_ms",
+                    "probability_tensor_ms",
+                    "probability_confidence_ms",
+                    "probability_refine_ms",
+                    "probability_outputs_ms",
+                    "tracker_total_ms",
+                    "node_total_ms",
+                    "receive_to_process_start_ms",
+                    "process_start_to_instances_publish_ms",
+                    "receive_to_instances_publish_ms",
+                    "output_select_ms",
+                    "output_mask_cpu_ms",
+                    "tracked_msg_mask_ms",
+                    "tracked_msg_tracks_ms",
+                    "tracked_msg_prototype_ms",
+                    "tracked_msg_confidence_ms",
+                    "tracked_msg_total_ms",
+                    "tracked_instances_publish_ms",
+                    "mask_viz_msg_ms",
+                    "mask_viz_publish_ms",
+                    "colorize_ms",
+                    "color_msg_ms",
+                    "color_publish_ms",
+                    "overlay_blend_ms",
+                    "overlay_msg_ms",
+                    "overlay_publish_ms",
+                    "keyframe_fastsam_mask_cpu_ms",
+                    "open_vocab_submit_ms",
+                    "proto_payload_ms",
+                    "depth_wait_ms",
+                    "recorder_record_ms",
+                    "queue_full_drops",
+                    "stride_skips",
+                    "callback_failures",
+                    "min_separation_skips",
+                    "process_stride",
+                    "keyframe_interval",
+                    "dino_max_memory_allocated_mb",
+                    "dino_max_memory_reserved_mb",
+                    "fastsam_max_memory_allocated_mb",
+                    "fastsam_max_memory_reserved_mb",
+                    "propagation_max_memory_allocated_mb",
+                    "propagation_max_memory_reserved_mb",
+                    "tracker_max_memory_allocated_mb",
+                    "tracker_max_memory_reserved_mb",
+                    "node_max_memory_allocated_mb",
+                    "node_max_memory_reserved_mb",
+                ),
+            )
+
+        # Data recorder (async)
+        self._recorder = DataRecorder(self, self.config.recorder)
+        self._recorder.save_config(self.config)
+        self._save_run_config_without_recorder()
+
+        self._depth_buffer = {}
+        self._depth_buffer_max_size = 256
+        self._depth_match_tolerance_ns = int(50e6)  # 50 ms
+        self._depth_lock = threading.Lock()
+        self._missing_depth_warnings = 0
+        self._needs_depth = self.config.recorder.enabled and (
+            self.config.recorder.save_depth or self.config.recorder.save_depth_viz
+        )
+        self._depth_sub = self.create_subscription(
+            Image, "depth_registered/image_rect", self._depth_callback, 10
+        )
+        if self._needs_depth:
+            self.get_logger().info("Depth recording enabled: subscribing to depth_registered/image_rect")
+        else:
+            self.get_logger().info(
+                "Depth input subscribed on depth_registered/image_rect "
+                "(recording disabled)"
+            )
+        
+        # Publishers
+        self._instances_pub = self.create_publisher(
+            TrackedInstances, "tracking/instances", 1
+        )
+        self._open_vocab = OpenVocabFeatureWorker(self, self.config.open_vocab)
+        self._mask_pub = self.create_publisher(
+            Image, "tracking/masks/image_raw", 1
+        )
+        self._color_pub = self.create_publisher(
+            Image, "tracking/color/image_raw", 1
+        )
+        self._overlay_pub = self.create_publisher(
+            Image, "tracking/overlay/image_raw", 1
+        )
+        
+        worker_config = self.config.worker
+        if self.config.recorder.enabled or self.config.recorder.save_observation_cache:
+            worker_config = replace(
+                worker_config,
+                queue_size=max(
+                    worker_config.queue_size,
+                    worker_config.save_cache_queue_size,
+                ),
+                subscription_queue_size=max(
+                    worker_config.subscription_queue_size,
+                    worker_config.save_cache_subscription_queue_size,
+                ),
+            )
+            self.get_logger().info(
+                "Expanded image worker queues for recording: "
+                f"queue_size={worker_config.queue_size}, "
+                f"subscription_queue_size={worker_config.subscription_queue_size}"
+            )
+
+        # Image worker for async processing
+        self._worker = ImageWorker(
+            self,
+            worker_config,
+            "color/image_raw",
+            self._process_frame,
+            keyframe_interval=self.config.tracker.keyframe_interval,
+            status_log_interval_s=self.config.logging.status_interval_s,
+            log_stride_skips=self.config.logging.log_stride_skips,
+        )
+        
+        self.get_logger().info("Instance tracking node ready!")
+
+    def _save_run_config_without_recorder(self) -> None:
+        """Persist config when a run dir was requested without full recording."""
+
+        if self._recorder.enabled:
+            return
+
+        run_dir = os.getenv("INSTANCE_TRACKING_OUTPUT_RUN_DIR", "").strip()
+        if not run_dir:
+            return
+
+        cfg_path = Path(os.path.expanduser(run_dir)) / "config.yaml"
+        try:
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            self.config.save(cfg_path)
+            self.get_logger().info(f"Saved run config to {cfg_path}")
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to write run config: {exc}")
+
+    def _process_frame(self, header, img, worker_frame):
+        """Process a single frame.
+        
+        Args:
+            header: ROS header from the image message
+            img: RGB image as numpy array [H, W, 3]
+            worker_frame: ImageWorkerFrame with source camera-frame metadata
+        """
+        self._synchronize_device()
+        self._reset_cuda_peak()
+        node_start_wall_time_s = time.time()
+        node_start = time.perf_counter()
+        camera_frame_index = int(worker_frame.camera_frame_index)
+        camera_keyframe = is_camera_keyframe(
+            camera_frame_index,
+            self.config.tracker.keyframe_interval,
+        )
+        with torch.no_grad():
+            result = self._tracker.process_frame(
+                img,
+                is_keyframe=camera_keyframe,
+                camera_frame_index=camera_frame_index,
+            )
+
+        publish_profile = {}
+        output_select_start = time.perf_counter()
+        output_mask = select_output_mask(
+            result,
+            self.config.output.publish_keyframe_fastsam_mask,
+        )
+        output_confidence = None
+        if self.config.output.publish_confidence_image:
+            output_confidence = select_output_confidence(
+                result,
+                self.config.output.publish_keyframe_fastsam_mask,
+            )
+        publish_profile["output_select_ms"] = (
+            time.perf_counter() - output_select_start
+        ) * 1000.0
+
+        output_mask_cpu_start = time.perf_counter()
+        output_mask_np = output_mask.cpu().numpy().astype(np.uint16)
+        publish_profile["output_mask_cpu_ms"] = (
+            time.perf_counter() - output_mask_cpu_start
+        ) * 1000.0
+        
+        # Publish tracked instances message
+        tracked_msg_timings = {}
+        tracked_msg_start = time.perf_counter()
+        instances_msg = Conversions.to_tracked_instances_msg(
+            header,
+            result,
+            mask_image=output_mask,
+            confidence_image=output_confidence,
+            include_confidence=self.config.output.publish_confidence_image,
+            include_prototypes=self.config.output.include_track_prototypes,
+            timings=tracked_msg_timings,
+        )
+        publish_profile.update(tracked_msg_timings)
+        publish_profile.setdefault("tracked_msg_mask_ms", 0.0)
+        publish_profile.setdefault("tracked_msg_tracks_ms", 0.0)
+        publish_profile.setdefault("tracked_msg_prototype_ms", 0.0)
+        publish_profile.setdefault("tracked_msg_confidence_ms", 0.0)
+        publish_profile["tracked_msg_total_ms"] = (
+            time.perf_counter() - tracked_msg_start
+        ) * 1000.0
+        instances_publish_start = time.perf_counter()
+        self._instances_pub.publish(instances_msg)
+        publish_profile["tracked_instances_publish_ms"] = (
+            time.perf_counter() - instances_publish_start
+        ) * 1000.0
+        instances_publish_wall_time_s = time.perf_counter()
+        
+        if self.config.output.publish_mask_visualization:
+            mask_msg_start = time.perf_counter()
+            mask_msg = Conversions.to_image_msg(
+                header,
+                output_mask_np,
+                encoding="mono16",
+            )
+            publish_profile["mask_viz_msg_ms"] = (
+                time.perf_counter() - mask_msg_start
+            ) * 1000.0
+            mask_publish_start = time.perf_counter()
+            self._mask_pub.publish(mask_msg)
+            publish_profile["mask_viz_publish_ms"] = (
+                time.perf_counter() - mask_publish_start
+            ) * 1000.0
+        else:
+            publish_profile["mask_viz_msg_ms"] = 0.0
+            publish_profile["mask_viz_publish_ms"] = 0.0
+        
+        color_img = None
+        if (
+            self.config.output.publish_color_visualization
+            or self.config.output.publish_overlay_visualization
+            or self._recorder.enabled
+        ):
+            colorize_start = time.perf_counter()
+            color_img = self._tracker.colorize_mask_image(output_mask)
+            publish_profile["colorize_ms"] = (
+                time.perf_counter() - colorize_start
+            ) * 1000.0
+        else:
+            publish_profile["colorize_ms"] = 0.0
+
+        if self.config.output.publish_color_visualization and color_img is not None:
+            color_msg_start = time.perf_counter()
+            color_msg = Conversions.to_image_msg(header, color_img, encoding="rgb8")
+            publish_profile["color_msg_ms"] = (
+                time.perf_counter() - color_msg_start
+            ) * 1000.0
+            color_publish_start = time.perf_counter()
+            self._color_pub.publish(color_msg)
+            publish_profile["color_publish_ms"] = (
+                time.perf_counter() - color_publish_start
+            ) * 1000.0
+        else:
+            publish_profile["color_msg_ms"] = 0.0
+            publish_profile["color_publish_ms"] = 0.0
+
+        if self.config.output.publish_overlay_visualization and color_img is not None:
+            overlay_blend_start = time.perf_counter()
+            overlay_img = render_mask_overlay(
+                img,
+                color_img,
+                output_mask_np,
+                alpha=self.config.output.overlay_alpha,
+            )
+            publish_profile["overlay_blend_ms"] = (
+                time.perf_counter() - overlay_blend_start
+            ) * 1000.0
+            overlay_msg_start = time.perf_counter()
+            overlay_msg = Conversions.to_image_msg(
+                header,
+                overlay_img,
+                encoding="rgb8",
+            )
+            publish_profile["overlay_msg_ms"] = (
+                time.perf_counter() - overlay_msg_start
+            ) * 1000.0
+            overlay_publish_start = time.perf_counter()
+            self._overlay_pub.publish(overlay_msg)
+            publish_profile["overlay_publish_ms"] = (
+                time.perf_counter() - overlay_publish_start
+            ) * 1000.0
+        else:
+            publish_profile["overlay_blend_ms"] = 0.0
+            publish_profile["overlay_msg_ms"] = 0.0
+            publish_profile["overlay_publish_ms"] = 0.0
+
+        keyframe_fastsam_mask = None
+        keyframe_mask_cpu_start = time.perf_counter()
+        needs_keyframe_mask_np = (
+            result.keyframe_fastsam_mask is not None
+            and (self.config.open_vocab.enabled or self._recorder.enabled)
+        )
+        if needs_keyframe_mask_np:
+            if result.is_keyframe and self.config.output.publish_keyframe_fastsam_mask:
+                keyframe_fastsam_mask = output_mask_np
+            else:
+                keyframe_fastsam_mask = (
+                    result.keyframe_fastsam_mask.cpu().numpy().astype(np.uint16)
+                )
+        publish_profile["keyframe_fastsam_mask_cpu_ms"] = (
+            time.perf_counter() - keyframe_mask_cpu_start
+        ) * 1000.0
+
+        open_vocab_submit_start = time.perf_counter()
+        if self.config.open_vocab.enabled:
+            source_mask = (
+                keyframe_fastsam_mask
+                if result.is_keyframe and keyframe_fastsam_mask is not None
+                else output_mask_np
+            )
+            self._open_vocab.submit(
+                header=header,
+                frame_index=result.frame_index,
+                tracks=result.tracks,
+                rgb=img,
+                mask_image=source_mask,
+                is_keyframe=result.is_keyframe,
+            )
+        publish_profile["open_vocab_submit_ms"] = (
+            time.perf_counter() - open_vocab_submit_start
+        ) * 1000.0
+
+        # Prepare prototype payload for recording (keyframes only)
+        proto_payload_start = time.perf_counter()
+        proto_payload = None
+        if (
+            self._recorder.enabled
+            and result.is_keyframe
+            and self.config.recorder.save_prototypes
+        ):
+            proto_entries = [
+                (t.instance_id, t.prototype, t.color)
+                for t in result.tracks
+                if t.prototype is not None and t.color is not None
+            ]
+            if proto_entries:
+                instance_ids = np.array([p[0] for p in proto_entries], dtype=np.uint16)
+                prototypes = np.stack([p[1].detach().cpu().numpy() for p in proto_entries]).astype(np.float16)
+                colors = np.stack([p[2] for p in proto_entries]).astype(np.uint8)
+                proto_payload = (instance_ids, prototypes, colors)
+        publish_profile["proto_payload_ms"] = (
+            time.perf_counter() - proto_payload_start
+        ) * 1000.0
+
+        # Record data asynchronously. Cache-recording mode blocks instead of
+        # dropping so the replay inputs remain complete.
+        if self._recorder.enabled:
+            depth_wait_start = time.perf_counter()
+            depth = self._wait_for_depth(header, img.shape[:2])
+            publish_profile["depth_wait_ms"] = (
+                time.perf_counter() - depth_wait_start
+            ) * 1000.0
+            recorder_start = time.perf_counter()
+            self._recorder.record(
+                result.frame_index,
+                img,
+                depth,
+                output_mask_np,
+                color_img,
+                features=result.features,  # Tensor or None, converted to numpy in recorder if needed
+                frame_features=result.frame_features,
+                is_keyframe=result.is_keyframe,
+                prototypes=proto_payload,
+                keyframe_fastsam_mask=keyframe_fastsam_mask,
+                keyframe_detection_masks=result.keyframe_detection_masks,
+                patch_argmax_confidence=result.patch_argmax_confidence,
+                final_argmax_confidence=result.final_argmax_confidence,
+                patch_argmax_confidence_raw=result.patch_argmax_confidence_raw,
+            )
+            publish_profile["recorder_record_ms"] = (
+                time.perf_counter() - recorder_start
+            ) * 1000.0
+        else:
+            publish_profile["depth_wait_ms"] = 0.0
+            publish_profile["recorder_record_ms"] = 0.0
+
+        if self._runtime_metrics is not None:
+            self._synchronize_device()
+            node_end = time.perf_counter()
+            node_end_wall_time_s = time.time()
+            node_total_ms = (node_end - node_start) * 1000.0
+            node_allocated_mb, node_reserved_mb = self._get_cuda_peak_mb()
+            runtime_profile = result.runtime_profile
+            worker_stats = self._worker.stats()
+            event = {
+                "frame_index": int(result.frame_index),
+                "camera_frame_index": int(camera_frame_index),
+                "frame_stamp_ns": int(self._stamp_to_ns(header)),
+                "is_keyframe": bool(result.is_keyframe),
+                "num_tracks": int(result.num_instances),
+                "uses_cached_observations": bool(self._tracker.uses_cached_observations),
+                "node_start_wall_time_s": float(node_start_wall_time_s),
+                "node_start_monotonic_s": float(node_start),
+                "node_end_wall_time_s": float(node_end_wall_time_s),
+                "node_end_monotonic_s": float(node_end),
+                "receive_wall_time_s": float(worker_frame.receive_wall_time_s),
+                "enqueue_wall_time_s": float(worker_frame.enqueue_wall_time_s),
+                "process_start_wall_time_s": float(
+                    worker_frame.process_start_wall_time_s
+                ),
+                "instances_publish_wall_time_s": float(
+                    instances_publish_wall_time_s
+                ),
+                "receive_to_process_start_ms": float(
+                    (
+                        worker_frame.process_start_wall_time_s
+                        - worker_frame.receive_wall_time_s
+                    )
+                    * 1000.0
+                ),
+                "process_start_to_instances_publish_ms": float(
+                    (
+                        instances_publish_wall_time_s
+                        - worker_frame.process_start_wall_time_s
+                    )
+                    * 1000.0
+                ),
+                "receive_to_instances_publish_ms": float(
+                    (
+                        instances_publish_wall_time_s
+                        - worker_frame.receive_wall_time_s
+                    )
+                    * 1000.0
+                ),
+                "queue_full_drops": int(worker_stats["queue_full_drops"]),
+                "stride_skips": int(worker_stats["stride_skips"]),
+                "callback_failures": int(worker_stats["callback_failures"]),
+                "min_separation_skips": int(worker_stats["min_separation_skips"]),
+                "process_stride": int(worker_stats["process_stride"]),
+                "keyframe_interval": int(worker_stats["keyframe_interval"]),
+                "node_total_ms": float(node_total_ms),
+                "node_max_memory_allocated_mb": node_allocated_mb,
+                "node_max_memory_reserved_mb": node_reserved_mb,
+            }
+            event.update({key: float(value) for key, value in publish_profile.items()})
+            if runtime_profile is not None:
+                event.update(
+                    {
+                        "dino_ms": float(runtime_profile.dino_ms),
+                        "fastsam_ms": float(runtime_profile.fastsam_ms),
+                        "keyframe_mask_refine_ms": float(
+                            runtime_profile.keyframe_mask_refine_ms
+                        ),
+                        "keyframe_track_update_ms": float(
+                            runtime_profile.keyframe_track_update_ms
+                        ),
+                        "keyframe_label_image_ms": float(
+                            runtime_profile.keyframe_label_image_ms
+                        ),
+                        "propagation_ms": float(runtime_profile.propagation_ms),
+                        "propagation_update_ms": float(
+                            runtime_profile.propagation_update_ms
+                        ),
+                        "probability_tensor_ms": float(
+                            runtime_profile.probability_tensor_ms
+                        ),
+                        "probability_confidence_ms": float(
+                            runtime_profile.probability_confidence_ms
+                        ),
+                        "probability_refine_ms": float(
+                            runtime_profile.probability_refine_ms
+                        ),
+                        "probability_outputs_ms": float(
+                            runtime_profile.probability_outputs_ms
+                        ),
+                        "tracker_total_ms": float(runtime_profile.tracker_total_ms),
+                        "dino_max_memory_allocated_mb": (
+                            runtime_profile.dino_max_memory_allocated_mb
+                        ),
+                        "dino_max_memory_reserved_mb": (
+                            runtime_profile.dino_max_memory_reserved_mb
+                        ),
+                        "fastsam_max_memory_allocated_mb": (
+                            runtime_profile.fastsam_max_memory_allocated_mb
+                        ),
+                        "fastsam_max_memory_reserved_mb": (
+                            runtime_profile.fastsam_max_memory_reserved_mb
+                        ),
+                        "propagation_max_memory_allocated_mb": (
+                            runtime_profile.propagation_max_memory_allocated_mb
+                        ),
+                        "propagation_max_memory_reserved_mb": (
+                            runtime_profile.propagation_max_memory_reserved_mb
+                        ),
+                        "tracker_max_memory_allocated_mb": (
+                            runtime_profile.tracker_max_memory_allocated_mb
+                        ),
+                        "tracker_max_memory_reserved_mb": (
+                            runtime_profile.tracker_max_memory_reserved_mb
+                        ),
+                    }
+                )
+            self._runtime_metrics.record_frame(event)
+        
+        # Log progress
+        if result.is_keyframe and self.config.logging.log_keyframes:
+            self.get_logger().info(
+                "Keyframe "
+                f"{result.frame_index} camera_frame={camera_frame_index}: "
+                f"{result.num_instances} instances"
+            )
+        elif not result.is_keyframe:
+            self.get_logger().debug(
+                f"Frame {result.frame_index}: propagated {result.num_instances} instances"
+            )
+    
+    def stop(self):
+        """Stop the node and cleanup."""
+        self._worker.stop()
+        self._open_vocab.stop()
+        worker_stats = self._worker.stats()
+        self.get_logger().info(
+            "ImageWorker summary: "
+            f"received={worker_stats['received']}, "
+            f"enqueued={worker_stats['enqueued']}, "
+            f"processed={worker_stats['processed']}, "
+            f"stride_skips={worker_stats['stride_skips']}, "
+            f"queue_full_drops={worker_stats['queue_full_drops']}, "
+            f"min_separation_skips={worker_stats['min_separation_skips']}, "
+            f"callback_failures={worker_stats['callback_failures']}, "
+            f"process_stride={worker_stats['process_stride']}, "
+            f"keyframe_interval={worker_stats['keyframe_interval']}, "
+            f"queue_size={worker_stats['queue_size']}, "
+            f"subscription_queue_size={worker_stats['subscription_queue_size']}"
+        )
+        self._recorder.stop()
+        if self._runtime_metrics is not None:
+            self._runtime_metrics.update_metadata({"image_worker": worker_stats})
+            self._runtime_metrics.close()
+
+    def _can_sample_cuda_memory(self) -> bool:
+        return (
+            self._runtime_metrics is not None
+            and self._tracker.device.type == "cuda"
+            and torch.cuda.is_available()
+        )
+
+    def _synchronize_device(self) -> None:
+        if (
+            self._runtime_metrics is not None
+            and self.config.tracker.benchmark.synchronize_timers
+            and self._tracker.device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.synchronize(self._tracker.device)
+
+    def _reset_cuda_peak(self) -> None:
+        if self._can_sample_cuda_memory():
+            torch.cuda.reset_peak_memory_stats(self._tracker.device)
+
+    def _get_cuda_peak_mb(self):
+        if not self._can_sample_cuda_memory():
+            return None, None
+
+        return (
+            float(torch.cuda.max_memory_allocated(self._tracker.device)) / 1024.0**2,
+            float(torch.cuda.max_memory_reserved(self._tracker.device)) / 1024.0**2,
+        )
+
+    @staticmethod
+    def _stamp_to_ns(header) -> int:
+        return int(header.stamp.sec) * 1_000_000_000 + int(header.stamp.nanosec)
+
+    def _depth_callback(self, msg: Image):
+        if not self._needs_depth:
+            return
+
+        try:
+            depth = Conversions.to_image(msg, encoding="passthrough")
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to decode depth image: {exc}")
+            return
+
+        stamp_ns = self._stamp_to_ns(msg.header)
+        with self._depth_lock:
+            self._depth_buffer[stamp_ns] = depth
+            if len(self._depth_buffer) > self._depth_buffer_max_size:
+                # Drop oldest depth frame when buffer grows beyond bound.
+                oldest = min(self._depth_buffer.keys())
+                self._depth_buffer.pop(oldest, None)
+
+    def _get_depth_for_stamp(self, stamp_ns: int):
+        with self._depth_lock:
+            depth = self._depth_buffer.pop(stamp_ns, None)
+            if depth is not None:
+                return depth
+
+            if not self._depth_buffer:
+                return None
+
+            nearest_stamp = min(self._depth_buffer, key=lambda x: abs(x - stamp_ns))
+            if abs(nearest_stamp - stamp_ns) <= self._depth_match_tolerance_ns:
+                return self._depth_buffer.pop(nearest_stamp)
+
+        return None
+
+    def _wait_for_depth(self, header, image_shape) -> np.ndarray:
+        if not self._needs_depth:
+            return np.empty((0, 0), dtype=np.float32)
+
+        stamp_ns = self._stamp_to_ns(header)
+        for _ in range(5):
+            depth = self._get_depth_for_stamp(stamp_ns)
+            if depth is not None:
+                return depth
+            time.sleep(0.002)
+
+        self._missing_depth_warnings += 1
+        if self._missing_depth_warnings % 50 == 1:
+            self.get_logger().warn(
+                "Missing matching depth frame for tracker output; saving NaN placeholder depth."
+            )
+        return np.full(image_shape, np.nan, dtype=np.float32)
+
+
+def main():
+    """Entry point for the node."""
+    rclpy.init()
+    
+    node = None
+    try:
+        node = InstanceTrackingNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            previous_sigint_handler = signal.getsignal(signal.SIGINT)
+            try:
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                node.stop()
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint_handler)
+        rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

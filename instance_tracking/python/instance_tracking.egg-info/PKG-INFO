@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: instance_tracking
+Version: 0.0.1
+Summary: Instance tracking with sparse segmentation and dense propagation
+Author-email: Peder Borge Hellesylt <pederbh@stud.ntnu.no>
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: torchmetrics
+Requires-Dist: termcolor
+Requires-Dist: ultralytics
+Requires-Dist: numpy<2
+Requires-Dist: spark_config @ git+https://github.com/MIT-SPARK/Spark-Config.git
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Provides-Extra: open-vocab
+Requires-Dist: open_clip_torch; extra == "open-vocab"

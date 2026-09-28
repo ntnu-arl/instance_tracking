@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>instance_tracking_ros</name>
+  <version>0.0.1</version>
+  <description>TrackGraph instance tracking ROS 2 interface</description>
+
+  <maintainer email="pederbh@stud.ntnu.no">Peder Borge Hellesylt</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <!-- Message dependencies -->
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>instance_tracking_msgs</depend>
+
+  <!-- Python dependencies -->
+  <depend>rclpy</depend>
+  <depend>cv_bridge</depend>
+  <exec_depend>rosbag2_py</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-torch</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

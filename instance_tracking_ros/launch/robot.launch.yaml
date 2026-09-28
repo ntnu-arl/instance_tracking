@@ -1,0 +1,24 @@
+# TrackGraph live-robot instance-tracker starting point.
+#
+# This launch does not start the RGB-D driver.
+---
+launch:
+  # CAMERA CONFIGURATION: edit these defaults or pass rgb_topic:=... etc.
+  # Use the same RGB/depth topics in trackgraph_robot.launch.yaml.
+  # TrackGraph tracking_namespace must be <tracker_namespace>/tracking.
+  - arg: {name: tracker_namespace, default: /front_camera}
+  - arg: {name: rgb_topic, default: /camera/camera/color/image_raw}
+  - arg: {name: depth_topic, default: /camera/camera/aligned_depth_to_color/image_raw}
+  - arg: {name: config_name, default: deployment}
+  - arg: {name: use_sim_time, default: 'false'}
+
+  - include:
+      file: $(find-pkg-share instance_tracking_ros)/launch/instance_tracking.launch.yaml
+      arg:
+        - {name: config_name, value: $(var config_name)}
+        - {name: namespace, value: $(var tracker_namespace)}
+        - {name: use_sim_time, value: $(var use_sim_time)}
+        - {name: rgb_topic, value: $(var rgb_topic)}
+        - {name: rgb_compressed_topic, value: $(var rgb_topic)/compressed}
+        - {name: depth_topic, value: $(var depth_topic)}
+        - {name: compressed_rgb, value: 'false'}
